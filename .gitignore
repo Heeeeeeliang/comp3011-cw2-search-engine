@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual envs
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local dev artefacts (not part of the submission)
+GENAI_LOG.md
+.crawl_cache/
+
+# Note: data/index.json is INTENTIONALLY committed (required submission artefact).
