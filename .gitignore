@@ -20,5 +20,6 @@ env/
 # Local dev artefacts (not part of the submission)
 GENAI_LOG.md
 .crawl_cache/
+.claude/
 
 # Note: data/index.json is INTENTIONALLY committed (required submission artefact).
