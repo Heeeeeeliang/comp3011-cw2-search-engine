@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import pickle
 from pathlib import Path
 
 import pytest
@@ -288,7 +289,37 @@ class TestPersistence:
     def test_load_rejects_unknown_format(self, tmp_path: Path) -> None:
         idx = Indexer()
         with pytest.raises(ValueError, match="unsupported format"):
-            idx.load(tmp_path / "x", fmt="pickle")
+            idx.load(tmp_path / "x", fmt="yaml")
+
+    def test_pickle_round_trip_preserves_index(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "idx.pkl"
+        populated.save(path, fmt="pickle")
+        fresh = Indexer()
+        fresh.load(path, fmt="pickle")
+        assert fresh.index == populated.index
+
+    def test_pickle_file_is_binary(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        # Pickle output must not be readable as UTF-8 text — otherwise we
+        # would have accidentally written JSON to a .pkl file.
+        path = tmp_path / "idx.pkl"
+        populated.save(path, fmt="pickle")
+        raw = path.read_bytes()
+        assert raw[:2] == b"\x80\x05"  # pickle protocol-5 header
+
+    def test_pickle_load_rejects_text_file(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        # Sanity: feeding a JSON file to fmt="pickle" must fail loudly,
+        # not silently corrupt the in-memory index.
+        path = tmp_path / "idx.json"
+        populated.save(path, fmt="json")
+        fresh = Indexer()
+        with pytest.raises(pickle.UnpicklingError):
+            fresh.load(path, fmt="pickle")
 
     def test_load_missing_file_raises_filenotfounderror(
         self, tmp_path: Path

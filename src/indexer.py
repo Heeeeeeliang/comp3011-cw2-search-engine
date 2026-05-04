@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import pickle
 import re
 from pathlib import Path
 from typing import Iterable, Union
@@ -57,8 +58,11 @@ LOGGER = logging.getLogger(__name__)
 # "don" + "t"), which matters because the corpus is full of quoted text.
 TOKEN_RE = re.compile(r"[a-z0-9']+")
 
-# Whitelist of accepted on-disk formats. Day 3 will append "pickle" here.
-SUPPORTED_FORMATS: tuple[str, ...] = ("json",)
+# Whitelist of accepted on-disk formats. JSON is the human-readable
+# default and the format the marker can open and inspect; pickle is a
+# faster (and ~3-5x smaller) alternative used by the CLI for `load`
+# performance and benchmarked in the README.
+SUPPORTED_FORMATS: tuple[str, ...] = ("json", "pickle")
 
 # Tags whose contents must be removed before text extraction. Anything
 # inside these is markup-machinery, never user-readable prose.
@@ -147,18 +151,23 @@ class Indexer:
     def save(self, path: Union[str, Path], fmt: str = "json") -> None:
         """Serialise :attr:`index` to ``path``.
 
-        The output is human-readable JSON (``indent=2``, ``sort_keys=True``)
-        because one of the marker's stated reasons to keep the index in
-        the repo is so they can open it. Determinism via ``sort_keys`` also
-        makes diffing two builds straightforward.
+        Two on-disk formats are supported:
+
+        * ``"json"`` — human-readable, ``indent=2``, ``sort_keys=True``,
+          ``ensure_ascii=False``. The default because the marker is told
+          to inspect the index file we submit, and deterministic key
+          order makes diffing two builds straightforward.
+        * ``"pickle"`` — binary, faster to load and noticeably smaller
+          on disk. Used by the CLI so subsequent ``load`` invocations
+          don't pay the JSON parse cost.
 
         Parameters
         ----------
         path:
             Destination file. The parent directory is created if missing.
         fmt:
-            Storage format. Only ``"json"`` is supported in this iteration;
-            anything else raises :class:`ValueError`.
+            Storage format; one of ``"json"`` or ``"pickle"``. Anything
+            else raises :class:`ValueError`.
 
         Raises
         ------
@@ -171,15 +180,21 @@ class Indexer:
             )
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("w", encoding="utf-8") as handle:
-            json.dump(
-                self.index,
-                handle,
-                indent=2,
-                sort_keys=True,
-                ensure_ascii=False,
-            )
-        LOGGER.info("Wrote index (%d words) to %s", len(self.index), target)
+        if fmt == "json":
+            with target.open("w", encoding="utf-8") as handle:
+                json.dump(
+                    self.index,
+                    handle,
+                    indent=2,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+        else:  # fmt == "pickle"
+            with target.open("wb") as handle:
+                pickle.dump(self.index, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        LOGGER.info(
+            "Wrote index (%d words, %s) to %s", len(self.index), fmt, target
+        )
 
     def load(self, path: Union[str, Path], fmt: str = "json") -> None:
         """Read a previously-saved index from ``path`` into :attr:`index`.
@@ -205,9 +220,13 @@ class Indexer:
                 f"unsupported format: {fmt!r}; allowed: {SUPPORTED_FORMATS}"
             )
         source = Path(path)
-        with source.open("r", encoding="utf-8") as handle:
-            self.index = json.load(handle)
-        LOGGER.info("Loaded %d words from %s", len(self.index), source)
+        if fmt == "json":
+            with source.open("r", encoding="utf-8") as handle:
+                self.index = json.load(handle)
+        else:  # fmt == "pickle"
+            with source.open("rb") as handle:
+                self.index = pickle.load(handle)
+        LOGGER.info("Loaded %d words from %s (%s)", len(self.index), source, fmt)
 
     def get_postings(self, word: str) -> dict:
         """Return the postings dict for ``word`` (empty dict if absent).
