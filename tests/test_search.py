@@ -15,7 +15,7 @@ import math
 import pytest
 
 from src.indexer import Indexer
-from src.search import SearchEngine
+from src.search import SearchEngine, _parse_query
 
 
 # --------------------------------------------------------------------- fixtures
@@ -450,3 +450,290 @@ class TestFindWithScores:
         urls_via_find = engine.find("alpha")
         urls_via_scores = [u for u, _ in engine.find_with_scores("alpha")]
         assert urls_via_find == urls_via_scores
+
+
+# ------------------------------------------------------------------ TestQueryParser
+
+
+class TestQueryParser:
+    """Behaviour of the module-level _parse_query helper.
+
+    The parser turns a raw query string into a list of "atoms": single
+    words (str) and phrases (tuple of words). Tokenisation (lower /
+    stopwords / stemming) happens later, in find_with_scores; the parser
+    is a pure syntactic split.
+    """
+
+    def test_empty_query_returns_empty_list(self) -> None:
+        assert _parse_query("") == []
+
+    def test_whitespace_only_returns_empty_list(self) -> None:
+        assert _parse_query("   \t\n  ") == []
+
+    def test_single_word_returns_str(self) -> None:
+        assert _parse_query("wisdom") == ["wisdom"]
+
+    def test_multiple_unquoted_words_return_strs(self) -> None:
+        assert _parse_query("good friends wisdom") == [
+            "good",
+            "friends",
+            "wisdom",
+        ]
+
+    def test_single_phrase_returns_tuple(self) -> None:
+        assert _parse_query('"good friends"') == [("good", "friends")]
+
+    def test_phrase_followed_by_word(self) -> None:
+        assert _parse_query('"good friends" wisdom') == [
+            ("good", "friends"),
+            "wisdom",
+        ]
+
+    def test_word_followed_by_phrase(self) -> None:
+        assert _parse_query('wisdom "good friends"') == [
+            "wisdom",
+            ("good", "friends"),
+        ]
+
+    def test_multiple_phrases(self) -> None:
+        assert _parse_query('"good friends" "lazy dog"') == [
+            ("good", "friends"),
+            ("lazy", "dog"),
+        ]
+
+    def test_quoted_single_word_collapses_to_str(self) -> None:
+        # `"wisdom"` is syntactically a phrase but has nothing to
+        # phrase-match on. The parser normalises it to a plain str so
+        # that find('"wisdom"') and find('wisdom') produce identical
+        # parser output (and TestPhraseQueries asserts the find()-level
+        # equivalence the spec requires).
+        assert _parse_query('"wisdom"') == ["wisdom"]
+
+    def test_apostrophe_in_word_does_not_choke(self) -> None:
+        # shlex.split(query, posix=True) -- the spec's first reach --
+        # would treat the apostrophe in "don't" as an unbalanced
+        # single-quote and raise ValueError. The customised lexer
+        # (quotes='"') preserves the contraction unchanged so Day 3.1's
+        # contraction-symmetry tests do not regress.
+        assert _parse_query("don't trust") == ["don't", "trust"]
+
+    def test_empty_quotes_dropped(self) -> None:
+        assert _parse_query('""') == []
+
+    def test_empty_quotes_with_word_drops_only_the_empty(self) -> None:
+        assert _parse_query('"" wisdom') == ["wisdom"]
+
+    def test_adjacent_quoted_runs_concatenate(self) -> None:
+        # POSIX shell behaviour: `"a "b" c"` is one token because
+        # adjacent quoted/unquoted runs concatenate. Once that single
+        # token "a b c" is split on whitespace it has 3 words, so the
+        # parser emits a tuple of 3. Asserted here directly so a future
+        # shlex change is visible rather than silent.
+        assert _parse_query('"a "b" c"') == [("a", "b", "c")]
+
+    def test_unbalanced_quote_raises_value_error(self) -> None:
+        with pytest.raises(ValueError):
+            _parse_query('"good friends')
+
+
+# ------------------------------------------------------------- TestPhraseQueries
+
+
+class TestPhraseQueries:
+    """Phrase queries match consecutive positions in the post-filter stream.
+
+    Position semantics inherit from Day 3.1: positions are stamped on
+    the **filtered** token list, so a phrase query implicitly skips
+    over stopwords in the source HTML. The tests below are calibrated
+    against that contract.
+    """
+
+    def test_phrase_matches_consecutive_words(self) -> None:
+        # "we are good friends" -> filtered tokens ["good", "friend"]
+        # at positions 0, 1 (stopwords "we"/"are" drop before
+        # positions are assigned). Phrase ("good", "friend") matches.
+        idx = Indexer()
+        idx.build([
+            ("https://example.com/p1", _wrap("we are good friends")),
+        ])
+        engine = SearchEngine(idx)
+        assert engine.find('"good friends"') == ["https://example.com/p1"]
+
+    def test_phrase_does_not_match_non_consecutive_words(self) -> None:
+        # "good people who are friends": after stopword removal/stem,
+        # tokens are ["good", "peopl", "who", "friend"]. ("who" is NOT
+        # in the curated stopword list -- only the personal pronouns
+        # i/you/he/she/it/we/they are.) Phrase ("good", "friend")
+        # therefore needs positions 0, 1 -- but "friend" is at 3, not
+        # 1. No match.
+        idx = Indexer()
+        idx.build([
+            ("https://example.com/p", _wrap("good people who are friends")),
+        ])
+        engine = SearchEngine(idx)
+        assert engine.find('"good friends"') == []
+
+    def test_phrase_and_word_query_intersects(self) -> None:
+        # Mixed query: phrase + bare word, AND-intersected.
+        #
+        # p1: "good friends share wisdom"
+        #     phrase OK (good@0, friend@1), wisdom present  -> match
+        # p2: "good friends together always"
+        #     phrase OK, no "wisdom"                         -> drop
+        # p3: "good people share wisdom about friends"
+        #     phrase fails (good@0 friend@5, not adjacent),
+        #     wisdom present, but AND fails                  -> drop
+        # p4: "good wisdom only here"
+        #     no "friends" at all -> phrase candidate set    -> drop
+        idx = Indexer()
+        idx.build([
+            ("https://example.com/p1", _wrap("good friends share wisdom")),
+            ("https://example.com/p2", _wrap("good friends together always")),
+            ("https://example.com/p3",
+             _wrap("good people share wisdom about friends")),
+            ("https://example.com/p4", _wrap("good wisdom only here")),
+        ])
+        engine = SearchEngine(idx)
+        assert engine.find('"good friends" wisdom') == [
+            "https://example.com/p1",
+        ]
+
+    def test_phrase_across_stopwords_works_correctly(self) -> None:
+        """The likely-bug spot: position-after-filter has consequences.
+
+        Page A text: "the good and friends here"
+            Filtered tokens: ["good", "friend", "here"]  (the/and dropped)
+            Positions:       [0,      1,        2]
+            Phrase ("good", "friend") needs (p, p+1) -> 0, 1: HIT.
+
+        Page B text: "the good wonderful friends here"
+            "wonderful" is NOT a stopword.
+            Filtered tokens: ["good", "wonder", "friend", "here"]
+            Positions:       [0,      1,        2,        3]
+            Phrase needs (p, p+1): 0, 1 -> friend? no, that's "wonder".
+                                   No other "good". MISS.
+
+        Page B is the canary -- dropping a stopword "completes" a
+        phrase, but inserting a content word breaks it. This is the
+        contract Day 3.1 set up; the test makes it observable.
+        """
+        idx = Indexer()
+        idx.build([
+            ("https://example.com/A", _wrap("the good and friends here")),
+            ("https://example.com/B",
+             _wrap("the good wonderful friends here")),
+        ])
+        engine = SearchEngine(idx)
+        assert engine.find('"good friends"') == ["https://example.com/A"]
+
+    def test_single_word_phrase_equivalent_to_unquoted(self) -> None:
+        # Spec-required equivalence: `find "wisdom"` must behave
+        # identically to `find wisdom`. Verified at both API levels.
+        idx = Indexer()
+        idx.build([
+            ("https://example.com/p1", _wrap("alpha wisdom beta")),
+            ("https://example.com/p2", _wrap("wisdom is everywhere")),
+            ("https://example.com/p3", _wrap("nothing useful here")),
+        ])
+        engine = SearchEngine(idx)
+        assert engine.find('"wisdom"') == engine.find("wisdom")
+        assert (
+            engine.find_with_scores('"wisdom"')
+            == engine.find_with_scores("wisdom")
+        )
+
+    def test_phrase_query_with_stemming(self) -> None:
+        # Plural query, singular page. Both stem to "friend"; phrase
+        # ("good", "friend") matches against ["good", "friend", ...].
+        # The stemming-symmetry tokenise() provides covers phrase
+        # queries by construction -- but worth locking in explicitly
+        # because phrase + stemming together is the subtle bit.
+        idx = Indexer()
+        idx.build([
+            ("https://example.com/p", _wrap("good friend always")),
+        ])
+        engine = SearchEngine(idx)
+        assert engine.find('"good friends"') == ["https://example.com/p"]
+
+    def test_unbalanced_quote_in_find_returns_empty_list(self) -> None:
+        # Graceful degradation: parser raises ValueError, find catches
+        # and returns []. A user typo should not crash the REPL.
+        idx = Indexer()
+        idx.build([("https://example.com/p", _wrap("good friends"))])
+        engine = SearchEngine(idx)
+        assert engine.find('"good friends') == []
+        assert engine.find_with_scores('"good friends') == []
+
+    def test_phrase_matches_at_later_occurrence_of_first_term(self) -> None:
+        # "good news good friends here" -> positions:
+        # good=0, news/new=1, good=2, friend=3, here=4
+        # start=0: friend at 1? no. start=2: friend at 3? YES.
+        # Locks in the for-each-start iteration in _phrase_matches.
+        idx = Indexer()
+        idx.build([
+            ("https://example.com/p", _wrap("good news good friends here")),
+        ])
+        engine = SearchEngine(idx)
+        assert engine.find('"good friends"') == ["https://example.com/p"]
+
+    def test_phrase_word_unknown_returns_empty(self) -> None:
+        # AND-intersection prefilter sees an empty postings set for
+        # the unknown stem and short-circuits to no candidates.
+        idx = Indexer()
+        idx.build([("https://example.com/p", _wrap("good friends here"))])
+        engine = SearchEngine(idx)
+        assert engine.find('"good unknownword"') == []
+
+    def test_unquoted_intra_word_punctuation_splits_to_AND(self) -> None:
+        # A single shlex token "quick,fox" tokenises to ["quick", "fox"]
+        # via TOKEN_RE. The find() loop must add each as a separate
+        # AND term -- this matches pre-3.3 behaviour where the whole
+        # query was tokenised at once.
+        idx = Indexer()
+        idx.build([
+            ("https://example.com/p1", _wrap("quick brown fox")),
+            ("https://example.com/p2", _wrap("quick only")),
+            ("https://example.com/p3", _wrap("fox only")),
+        ])
+        engine = SearchEngine(idx)
+        assert engine.find("quick,fox") == ["https://example.com/p1"]
+
+    def test_pure_stopword_phrase_returns_empty(self) -> None:
+        # `"the and a"` -> tokenise -> [] -> phrase part skipped ->
+        # url_sets empty -> return [].
+        idx = Indexer()
+        idx.build([("https://example.com/p", _wrap("good friends"))])
+        engine = SearchEngine(idx)
+        assert engine.find('"the and a"') == []
+
+    def test_phrase_collapses_when_only_one_content_term_remains(self) -> None:
+        # `"good and"` -> tokenise -> ["good"] (len 1). Collapses to a
+        # plain single-term postings lookup; phrase matching never
+        # runs. The page just needs to contain "good" somewhere.
+        idx = Indexer()
+        idx.build([
+            ("https://example.com/p1", _wrap("good things happen")),
+            ("https://example.com/p2", _wrap("nothing here")),
+        ])
+        engine = SearchEngine(idx)
+        assert engine.find('"good and"') == ["https://example.com/p1"]
+
+    def test_phrase_outranks_non_phrase_in_combined_query(self) -> None:
+        # Sanity check on phrase-aware ranking: among AND-matching
+        # docs, the phrase pre-filter has already trimmed the
+        # candidate set, and constituent-sum TF-IDF ranks them.
+        # p1: "good friends" adjacent, "wisdom" present, len 4
+        # p2: "good friends" adjacent, "wisdom" present, len 6
+        # Both pass phrase + AND. Shorter doc has higher tf -> ranks first.
+        idx = Indexer()
+        idx.build([
+            ("https://example.com/p1", _wrap("good friends share wisdom")),
+            ("https://example.com/p2",
+             _wrap("good friends together share quiet wisdom")),
+        ])
+        engine = SearchEngine(idx)
+        ranked = engine.find('"good friends" wisdom')
+        assert ranked == [
+            "https://example.com/p1",
+            "https://example.com/p2",
+        ]
