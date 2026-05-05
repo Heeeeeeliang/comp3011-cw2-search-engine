@@ -38,6 +38,14 @@ Design choices
   page sets yields a clean rebuild rather than silent accumulation. This
   is the more conservative choice and matches a marker's intuition: an
   index is the output of a corpus, not a running tally.
+* **Doc lengths persisted alongside the postings.** Task 3.2 (TF-IDF)
+  needs the post-filter token count per URL, and reconstructing it
+  from the index would mean a full pass at load time. Storing
+  ``doc_lengths`` on disk makes ``load`` O(N) for restoring index +
+  lengths together. The on-disk shape is wrapped in a versioned
+  envelope (``{"version": 2, "index": ..., "doc_lengths": ...}``) so
+  pre-3.2 index files are detected and rejected with a helpful
+  rebuild prompt rather than silently producing garbled scores.
 """
 
 from __future__ import annotations
@@ -64,6 +72,15 @@ TOKEN_RE = re.compile(r"[a-z0-9']+")
 # faster (and ~3-5x smaller) alternative used by the CLI for `load`
 # performance and benchmarked in the README.
 SUPPORTED_FORMATS: tuple[str, ...] = ("json", "pickle")
+
+# On-disk envelope version. Bumped from "no envelope" -> 2 in Task 3.2
+# when TF-IDF needed doc_lengths. Pre-3.2 files (a bare postings dict)
+# are detected on load and rejected with a "rebuild" prompt. Backfill
+# would be technically possible (the sum of freq per URL across all
+# terms equals the token count), but rebuilding from the cache is
+# ~150ms for 213 pages and the explicit version bump avoids quietly
+# mixing two on-disk shapes.
+INDEX_FORMAT_VERSION: int = 2
 
 # Tags whose contents must be removed before text extraction. Anything
 # inside these is markup-machinery, never user-readable prose.
@@ -169,11 +186,16 @@ class Indexer:
 
     def __init__(self) -> None:
         self.index: dict[str, dict[str, dict]] = {}
+        # url -> count of post-filter tokens. Populated by build(); used
+        # by SearchEngine._score for the TF denominator. Stored on every
+        # indexed URL (including 0-token pages, which can't appear in
+        # any postings but still count toward N for IDF).
+        self.doc_lengths: dict[str, int] = {}
 
     # ------------------------------------------------------------------ public
 
     def build(self, pages: Iterable[tuple[str, str]]) -> None:
-        """Populate :attr:`index` from an iterable of ``(url, html)`` pairs.
+        """Populate :attr:`index` and :attr:`doc_lengths` from ``pages``.
 
         Streaming is supported: ``pages`` may be a generator from the
         crawler, so we never need the whole corpus in memory at once. The
@@ -187,17 +209,19 @@ class Indexer:
             verbatim as posting keys; HTML is parsed and tokenised.
         """
         self.index = {}
-        page_count = 0
+        self.doc_lengths = {}
         for url, html in pages:
             tokens = tokenise(_strip_html(html))
+            self.doc_lengths[url] = len(tokens)
             for position, token in enumerate(tokens):
                 postings = self.index.setdefault(token, {})
                 entry = postings.setdefault(url, {"freq": 0, "positions": []})
                 entry["freq"] += 1
                 entry["positions"].append(position)
-            page_count += 1
         LOGGER.info(
-            "Indexed %d pages, %d unique words", page_count, len(self.index)
+            "Indexed %d pages, %d unique words",
+            len(self.doc_lengths),
+            len(self.index),
         )
 
     def save(self, path: Union[str, Path], fmt: str = "json") -> None:
@@ -232,10 +256,15 @@ class Indexer:
             )
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": INDEX_FORMAT_VERSION,
+            "index": self.index,
+            "doc_lengths": self.doc_lengths,
+        }
         if fmt == "json":
             with target.open("w", encoding="utf-8") as handle:
                 json.dump(
-                    self.index,
+                    payload,
                     handle,
                     indent=2,
                     sort_keys=True,
@@ -243,7 +272,7 @@ class Indexer:
                 )
         else:  # fmt == "pickle"
             with target.open("wb") as handle:
-                pickle.dump(self.index, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
         LOGGER.info(
             "Wrote index (%d words, %s) to %s", len(self.index), fmt, target
         )
@@ -261,7 +290,9 @@ class Indexer:
         Raises
         ------
         ValueError
-            If ``fmt`` is not in :data:`SUPPORTED_FORMATS`.
+            If ``fmt`` is not in :data:`SUPPORTED_FORMATS`, or if the
+            file is in a pre-3.2 (un-versioned) format, or carries a
+            version this build doesn't understand.
         FileNotFoundError
             If ``path`` does not exist.
         json.JSONDecodeError
@@ -274,10 +305,23 @@ class Indexer:
         source = Path(path)
         if fmt == "json":
             with source.open("r", encoding="utf-8") as handle:
-                self.index = json.load(handle)
+                payload = json.load(handle)
         else:  # fmt == "pickle"
             with source.open("rb") as handle:
-                self.index = pickle.load(handle)
+                payload = pickle.load(handle)
+        if not isinstance(payload, dict) or "version" not in payload:
+            raise ValueError(
+                f"{source} is in pre-3.2 index format (no version envelope). "
+                "Rebuild with `build` to upgrade."
+            )
+        version = payload["version"]
+        if version != INDEX_FORMAT_VERSION:
+            raise ValueError(
+                f"unsupported index version {version!r} in {source}; "
+                f"this build expects version {INDEX_FORMAT_VERSION}"
+            )
+        self.index = payload["index"]
+        self.doc_lengths = payload["doc_lengths"]
         LOGGER.info("Loaded %d words from %s (%s)", len(self.index), source, fmt)
 
     def get_postings(self, word: str) -> dict:

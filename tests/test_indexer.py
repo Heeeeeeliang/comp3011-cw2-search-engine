@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from src.indexer import (
+    INDEX_FORMAT_VERSION,
     NON_CONTENT_TAGS,
     STOPWORDS,
     SUPPORTED_FORMATS,
@@ -564,3 +565,124 @@ class TestDisabledOptions:
         assert tokenise(
             "the running fox", remove_stopwords=False, stem=True
         ) == ["the", "run", "fox"]
+
+
+# ---------------------------------------------------------------- TestDocLengths
+
+
+class TestDocLengths:
+    """Index tracks per-URL token count for TF-IDF (Task 3.2)."""
+
+    def test_doc_length_records_post_filter_token_count(self) -> None:
+        # "the quick brown fox" -> ["quick","brown","fox"] after
+        # stopword removal; length is 3, NOT 4. Phrase-aware ranking
+        # depends on this matching the index's positions.
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>the quick brown fox</p>"))])
+        assert idx.doc_lengths == {"u": 3}
+
+    def test_doc_length_for_repeated_words_counts_each_occurrence(self) -> None:
+        # tf is freq / doc_length, so duplicates must inflate the
+        # denominator.
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>cat cat cat dog</p>"))])
+        assert idx.doc_lengths == {"u": 4}
+
+    def test_empty_page_recorded_with_length_zero(self) -> None:
+        # Pages that tokenise to nothing still contribute to N for
+        # idf purposes, but their entry is 0.
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>the a an</p>"))])
+        assert idx.doc_lengths == {"u": 0}
+
+    def test_doc_lengths_reset_on_rebuild(self) -> None:
+        # Same idempotency contract as the index itself.
+        idx = Indexer()
+        idx.build([("u1", _wrap("<p>old text</p>"))])
+        idx.build([("u2", _wrap("<p>new text here</p>"))])
+        assert "u1" not in idx.doc_lengths
+        assert idx.doc_lengths == {"u2": 3}
+
+
+# -------------------------------------------------- TestPersistenceVersionedFormat
+
+
+class TestPersistenceVersionedFormat:
+    """The 3.2 envelope: {"version", "index", "doc_lengths"}."""
+
+    @pytest.fixture
+    def populated(self) -> Indexer:
+        idx = Indexer()
+        idx.build(
+            [
+                ("u1", _wrap("<p>alpha beta alpha</p>")),
+                ("u2", _wrap("<p>beta gamma</p>")),
+            ]
+        )
+        return idx
+
+    def test_saved_json_carries_version_field(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "idx.json"
+        populated.save(path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["version"] == INDEX_FORMAT_VERSION
+
+    def test_saved_json_carries_doc_lengths(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "idx.json"
+        populated.save(path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        # alpha + beta + alpha => 3 tokens for u1; beta + gamma => 2.
+        assert payload["doc_lengths"] == {"u1": 3, "u2": 2}
+
+    def test_round_trip_preserves_doc_lengths(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "idx.json"
+        populated.save(path)
+        fresh = Indexer()
+        fresh.load(path)
+        assert fresh.doc_lengths == populated.doc_lengths
+
+    def test_pickle_round_trip_preserves_doc_lengths(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "idx.pkl"
+        populated.save(path, fmt="pickle")
+        fresh = Indexer()
+        fresh.load(path, fmt="pickle")
+        assert fresh.doc_lengths == populated.doc_lengths
+
+    def test_load_rejects_pre_3_2_format(self, tmp_path: Path) -> None:
+        # The Day-2 shape: a bare postings dict, no version envelope.
+        bare = tmp_path / "old.json"
+        bare.write_text(
+            '{"alpha": {"u": {"freq": 1, "positions": [0]}}}',
+            encoding="utf-8",
+        )
+        idx = Indexer()
+        with pytest.raises(ValueError, match="pre-3.2"):
+            idx.load(bare)
+
+    def test_load_rejects_unsupported_version(self, tmp_path: Path) -> None:
+        # A future format we don't know how to read.
+        future = tmp_path / "future.json"
+        future.write_text(
+            '{"version": 99, "index": {}, "doc_lengths": {}}',
+            encoding="utf-8",
+        )
+        idx = Indexer()
+        with pytest.raises(ValueError, match="unsupported index version"):
+            idx.load(future)
+
+    def test_pickle_load_rejects_pre_3_2_format(self, tmp_path: Path) -> None:
+        # Same envelope check on the binary path.
+        bare = tmp_path / "old.pkl"
+        with bare.open("wb") as f:
+            pickle.dump({"alpha": {"u": {"freq": 1, "positions": [0]}}}, f)
+        idx = Indexer()
+        with pytest.raises(ValueError, match="pre-3.2"):
+            idx.load(bare, fmt="pickle")
