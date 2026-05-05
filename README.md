@@ -589,41 +589,16 @@ No `nltk.download(...)` is required at install time — see
 
 ## GenAI declaration
 
-This project was developed with assistance from Claude (Anthropic),
-used in two surfaces:
+This project was developed with AI assistance, in line with the assignment's
+"Green tier" GenAI policy. The tools used were **Claude Opus 4.7** (via the
+anthropic.com chat UI) and **Claude Code CLI** (Opus 4.7) — the latter as a
+pair-programming surface running inside the project directory.
 
-- **Claude Opus 4.7 via the anthropic.com chat UI** for early scaffolding
-  on Day 1 (the crawler).
-- **Claude Code CLI (Opus 4.7, 1M-context)** for Days 2–3 as a
-  pair-programming surface running inside the project directory, with
-  read/write access to source and test files via tool use.
-
-Per-day usage notes, concrete pushbacks, things the AI got wrong, and
-things I (the student) decided to do differently are recorded in
-`GENAI_LOG.md` (local only, not committed — see `.gitignore`). That
-log is the raw material for the video's GenAI critical-evaluation
-segment (15% of the rubric).
-
-A short summary of the kinds of moments the log captures:
-
-- AI suggested `.decompose()` on `<script>` / `<style>` tags before
-  text extraction — a non-obvious detail that prevents inline JS from
-  leaking into the index.
-- AI's first `do_build` had no error handling. Pushed back; added the
-  `try/except CrawlError` and a `_RaisingCrawler` fixture.
-- AI initially recommended `shlex.split(query, posix=True)` for the
-  phrase parser — would have crashed on contractions like `don't`.
-  Verified empirically and switched to `shlex.shlex` with
-  `quotes='"'`.
-- AI's first `_NoNetworkSession` integration fixture missed the
-  `.headers` attribute the Crawler writes to. Surfaced the contract
-  on first run; fixed in the same commit.
-- AI claimed Pickle would be 3-5× faster to load. Benchmarked and
-  reported the actual 1.6× — a smaller speedup than advertised, but
-  the save (24×) and disk-size (6.5×) wins justify the dual storage.
-
-The video walks through the most significant of these in detail.
-
+A timestamped log of every substantive AI interaction — including specific
+points where the AI was wrong, where I pushed back, and design decisions I
+made independently — was kept throughout development as raw material for the
+critical evaluation. The video demonstration covers the most significant of
+these.
 ---
 
 ## Future work
