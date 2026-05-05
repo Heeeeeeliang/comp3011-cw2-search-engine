@@ -594,11 +594,6 @@ This project was developed with AI assistance, in line with the assignment's
 anthropic.com chat UI) and **Claude Code CLI** (Opus 4.7) — the latter as a
 pair-programming surface running inside the project directory.
 
-A timestamped log of every substantive AI interaction — including specific
-points where the AI was wrong, where I pushed back, and design decisions I
-made independently — was kept throughout development as raw material for the
-critical evaluation. The video demonstration covers the most significant of
-these.
 ---
 
 ## Future work
