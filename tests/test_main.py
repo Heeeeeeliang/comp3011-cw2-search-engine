@@ -149,34 +149,69 @@ class TestDoBuild:
 
 
 class TestDoLoad:
-    """``do_load`` reads from ``INDEX_JSON`` with friendly error handling."""
+    """``do_load`` prefers the pickle (faster) and falls back to JSON."""
 
-    def test_load_happy_path_wires_search(
+    @pytest.fixture
+    def patched_paths(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> tuple[Path, Path]:
+        json_path = tmp_path / "index.json"
+        pkl_path = tmp_path / "index.pkl"
+        # Both paths are patched: without patching the pickle constant
+        # too, do_load would happily prefer the real data/index.pkl
+        # committed on Day 3.2 and the test would silently load that
+        # instead of the tmp fixture.
+        monkeypatch.setattr(main_module, "INDEX_JSON", json_path)
+        monkeypatch.setattr(main_module, "INDEX_PKL", pkl_path)
+        return json_path, pkl_path
+
+    def test_load_prefers_pickle_when_both_exist(
+        self, patched_paths: tuple[Path, Path]
     ) -> None:
-        # Pre-populate an index file so do_load has something to read.
+        json_path, pkl_path = patched_paths
         seed = Indexer()
         seed.build(_FAKE_PAGES)
-        path = tmp_path / "index.json"
-        seed.save(path, fmt="json")
-        monkeypatch.setattr(main_module, "INDEX_JSON", path)
+        seed.save(json_path)  # auto-detect json
+        seed.save(pkl_path)   # auto-detect pickle
+        assert json_path.exists() and pkl_path.exists()
 
         shell = _make_shell()
         shell.do_load("")
 
-        assert "Loaded 3 words from" in shell.stdout.getvalue()
-        assert path.as_posix() in shell.stdout.getvalue()
+        out = shell.stdout.getvalue()
+        # Loaded path should be the pickle (faster), not the JSON.
+        assert pkl_path.as_posix() in out
+        assert json_path.as_posix() not in out
+        assert "Loaded 3 words from" in out
+        # Wired up the same as before; word lookup still works.
         assert isinstance(shell.indexer, Indexer)
         assert isinstance(shell.search, SearchEngine)
-        # The loaded postings should match a known fixture word.
         assert shell.search.print_word("hello") != {}
 
-    def test_load_missing_file_prints_helpful_message(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    def test_load_falls_back_to_json_when_pickle_missing(
+        self, patched_paths: tuple[Path, Path]
     ) -> None:
-        monkeypatch.setattr(
-            main_module, "INDEX_JSON", tmp_path / "absent.json"
-        )
+        json_path, pkl_path = patched_paths
+        seed = Indexer()
+        seed.build(_FAKE_PAGES)
+        seed.save(json_path)  # only JSON written; pkl_path unused
+        assert json_path.exists() and not pkl_path.exists()
+
+        shell = _make_shell()
+        shell.do_load("")
+
+        out = shell.stdout.getvalue()
+        # Reported source is the JSON fallback.
+        assert json_path.as_posix() in out
+        assert "Loaded 3 words from" in out
+        assert shell.search.print_word("hello") != {}
+
+    def test_load_missing_both_files_prints_helpful_message(
+        self, patched_paths: tuple[Path, Path]
+    ) -> None:
+        json_path, pkl_path = patched_paths
+        # Neither file was created; both `.exists()` checks return False.
+        assert not json_path.exists() and not pkl_path.exists()
 
         shell = _make_shell()
         shell.do_load("")

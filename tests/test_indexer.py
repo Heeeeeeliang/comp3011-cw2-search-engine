@@ -23,6 +23,7 @@ from src.indexer import (
     SUPPORTED_FORMATS,
     TOKEN_RE,
     Indexer,
+    _format_from_path,
     _strip_html,
     tokenise,
 )
@@ -686,3 +687,304 @@ class TestPersistenceVersionedFormat:
         idx = Indexer()
         with pytest.raises(ValueError, match="pre-3.2"):
             idx.load(bare, fmt="pickle")
+
+
+# ----------------------------------------------------------- TestPickleRoundTrip
+
+
+class TestPickleRoundTrip:
+    """Pickle save/load preserves index, doc_lengths, and on-disk shape.
+
+    Complementary to TestPersistence's pickle assertions: that class
+    proves "pickle works alongside JSON"; this one is the focused
+    audit of the binary path that Day 3.4 promotes from secondary to
+    co-equal. Tests are deliberately minimal — the heavy lifting
+    happens in TestPersistence and TestPersistenceVersionedFormat.
+    """
+
+    @pytest.fixture
+    def populated(self) -> Indexer:
+        idx = Indexer()
+        idx.build(
+            [
+                ("u1", _wrap("<p>alpha beta alpha</p>")),
+                ("u2", _wrap("<p>beta gamma</p>")),
+                ("u3", _wrap("<p>alpha gamma delta</p>")),
+            ]
+        )
+        return idx
+
+    def test_pickle_round_trip_index_identical(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "rt.pkl"
+        populated.save(path, fmt="pickle")
+        fresh = Indexer()
+        fresh.load(path, fmt="pickle")
+        assert fresh.index == populated.index
+
+    def test_pickle_round_trip_doc_lengths_identical(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "rt.pkl"
+        populated.save(path, fmt="pickle")
+        fresh = Indexer()
+        fresh.load(path, fmt="pickle")
+        assert fresh.doc_lengths == populated.doc_lengths
+
+    def test_pickle_smaller_than_json_on_disk(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        # The "Pickle is ~3-5x smaller" claim from the brief is small-
+        # scale-sensitive (pickle's overhead can dominate on tiny
+        # corpora) but should at least hold once the index has any
+        # meaningful content. With three pages and a handful of
+        # postings, pickle should still come in under JSON.
+        json_path = tmp_path / "rt.json"
+        pkl_path = tmp_path / "rt.pkl"
+        populated.save(json_path, fmt="json")
+        populated.save(pkl_path, fmt="pickle")
+        assert pkl_path.stat().st_size < json_path.stat().st_size
+
+
+# ------------------------------------------------------ TestFormatAutoDetection
+
+
+class TestFormatAutoDetection:
+    """``_format_from_path`` and the fmt=None default on save/load."""
+
+    def test_format_from_path_json_extension(self) -> None:
+        assert _format_from_path("index.json") == "json"
+
+    def test_format_from_path_pkl_extension(self) -> None:
+        assert _format_from_path("index.pkl") == "pickle"
+
+    def test_format_from_path_pickle_extension(self) -> None:
+        assert _format_from_path("index.pickle") == "pickle"
+
+    def test_format_from_path_uppercase_extension_normalises(self) -> None:
+        # Path("INDEX.JSON").suffix is ".JSON" -- the helper case-folds
+        # before lookup so users on case-preserving filesystems are
+        # not surprised.
+        assert _format_from_path("INDEX.JSON") == "json"
+        assert _format_from_path("INDEX.PKL") == "pickle"
+
+    def test_format_from_path_unknown_extension_falls_back_to_json(
+        self,
+    ) -> None:
+        # Fallback is JSON, not pickle. Documented reason: pickle.load
+        # executes arbitrary code from the file, so silently picking
+        # pickle for an unknown extension would be a security smell.
+        assert _format_from_path("index.yaml") == "json"
+        assert _format_from_path("index.txt") == "json"
+        assert _format_from_path("index.bak") == "json"
+
+    def test_format_from_path_no_extension_falls_back_to_json(self) -> None:
+        assert _format_from_path("index") == "json"
+        assert _format_from_path("/path/to/no_ext") == "json"
+
+    def test_format_from_path_accepts_path_objects(self) -> None:
+        assert _format_from_path(Path("a") / "b" / "c.pkl") == "pickle"
+
+    def test_save_uses_extension_when_fmt_omitted_pkl(
+        self, tmp_path: Path
+    ) -> None:
+        # End-to-end: passing a .pkl path with no fmt arg must produce
+        # an actual pickle file (binary header), not JSON.
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>alpha beta</p>"))])
+        path = tmp_path / "auto.pkl"
+        idx.save(path)  # no fmt -- relies on _format_from_path
+        raw = path.read_bytes()
+        assert raw[:2] == b"\x80\x05"  # pickle protocol-5 header
+
+    def test_save_uses_extension_when_fmt_omitted_json(
+        self, tmp_path: Path
+    ) -> None:
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>alpha beta</p>"))])
+        path = tmp_path / "auto.json"
+        idx.save(path)
+        # JSON files start with "{" after BOM-free UTF-8 encoding.
+        assert path.read_text(encoding="utf-8").lstrip().startswith("{")
+
+    def test_load_uses_extension_when_fmt_omitted_pkl(
+        self, tmp_path: Path
+    ) -> None:
+        seed = Indexer()
+        seed.build([("u", _wrap("<p>alpha beta</p>"))])
+        path = tmp_path / "auto.pkl"
+        seed.save(path, fmt="pickle")  # explicit save
+        fresh = Indexer()
+        fresh.load(path)  # auto-detect on the load side
+        assert fresh.index == seed.index
+
+    def test_load_uses_extension_when_fmt_omitted_json(
+        self, tmp_path: Path
+    ) -> None:
+        seed = Indexer()
+        seed.build([("u", _wrap("<p>alpha beta</p>"))])
+        path = tmp_path / "auto.json"
+        seed.save(path, fmt="json")
+        fresh = Indexer()
+        fresh.load(path)
+        assert fresh.index == seed.index
+
+    def test_unknown_extension_save_writes_json_via_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        # _format_from_path falls back to JSON for unknown extensions.
+        # End-to-end: a .yaml path with fmt omitted writes valid JSON
+        # (not yaml -- we don't support yaml).
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>alpha</p>"))])
+        path = tmp_path / "weird.yaml"
+        idx.save(path)
+        assert path.read_text(encoding="utf-8").lstrip().startswith("{")
+        # And it round-trips with the same fallback on load.
+        fresh = Indexer()
+        fresh.load(path)
+        assert fresh.index == idx.index
+
+
+# ------------------------------------------------------ TestUnknownFormatRejected
+
+
+class TestUnknownFormatRejected:
+    """Explicit unsupported ``fmt`` is a hard error on both save and load.
+
+    Auto-detection only runs when ``fmt`` is omitted; an explicit
+    ``fmt`` value bypasses path inspection and goes straight to
+    validation. The error message must list the supported formats so
+    a user typo gets a self-correcting hint rather than a stack trace.
+    """
+
+    def test_save_with_yaml_format_raises_value_error(
+        self, tmp_path: Path
+    ) -> None:
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>alpha</p>"))])
+        with pytest.raises(ValueError) as exc_info:
+            idx.save(tmp_path / "x", fmt="yaml")
+        message = str(exc_info.value)
+        assert "yaml" in message
+        assert "json" in message
+        assert "pickle" in message
+
+    def test_load_with_yaml_format_raises_value_error(
+        self, tmp_path: Path
+    ) -> None:
+        # Path doesn't even need to exist -- fmt is validated first.
+        idx = Indexer()
+        with pytest.raises(ValueError) as exc_info:
+            idx.load(tmp_path / "x.yaml", fmt="yaml")
+        message = str(exc_info.value)
+        assert "yaml" in message
+        assert "json" in message
+        assert "pickle" in message
+
+    def test_save_with_empty_string_format_raises(self, tmp_path: Path) -> None:
+        # Edge case: an empty string is not the same as None. None
+        # triggers auto-detect; "" hits the validation arm.
+        idx = Indexer()
+        with pytest.raises(ValueError, match="unsupported format"):
+            idx.save(tmp_path / "x.json", fmt="")
+
+
+# ----------------------------------------------------- TestCrossFormatCompatibility
+
+
+class TestCrossFormatCompatibility:
+    """JSON and Pickle round-trips produce equivalent in-memory state.
+
+    The two formats serialise the same envelope
+    (``{"version", "index", "doc_lengths"}``) and the loader is
+    format-agnostic about the resulting object. These tests prove the
+    chosen serialisation is lossless on both branches and that a user
+    is free to pick either.
+
+    JSON's lack of integer keys is **not** an issue here because the
+    index uses string keys throughout (URLs and tokens), and
+    doc_lengths maps URL strings to ints (ints are valid JSON values
+    on the right side; only int-keys are dropped). We therefore do
+    not need a normalisation step.
+    """
+
+    @pytest.fixture
+    def populated(self) -> Indexer:
+        idx = Indexer()
+        idx.build(
+            [
+                ("https://example.com/a", _wrap("<p>alpha beta alpha</p>")),
+                ("https://example.com/b", _wrap("<p>beta gamma delta</p>")),
+                ("https://example.com/c", _wrap("<p>alpha gamma</p>")),
+            ]
+        )
+        return idx
+
+    def test_json_round_trip_preserves_full_state(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "x.json"
+        populated.save(path, fmt="json")
+        fresh = Indexer()
+        fresh.load(path, fmt="json")
+        assert fresh.index == populated.index
+        assert fresh.doc_lengths == populated.doc_lengths
+
+    def test_pickle_round_trip_preserves_full_state(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "x.pkl"
+        populated.save(path, fmt="pickle")
+        fresh = Indexer()
+        fresh.load(path, fmt="pickle")
+        assert fresh.index == populated.index
+        assert fresh.doc_lengths == populated.doc_lengths
+
+    def test_json_and_pickle_yield_same_in_memory_state(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        # Save the same indexer to both formats, load each into a
+        # fresh instance, and compare the two reloaded instances. If
+        # either branch has a serialisation bug (e.g. pickle preserves
+        # int positions but JSON coerces to str), the comparison
+        # surfaces it.
+        json_path = tmp_path / "x.json"
+        pkl_path = tmp_path / "x.pkl"
+        populated.save(json_path, fmt="json")
+        populated.save(pkl_path, fmt="pickle")
+        from_json = Indexer()
+        from_pkl = Indexer()
+        from_json.load(json_path, fmt="json")
+        from_pkl.load(pkl_path, fmt="pickle")
+        assert from_json.index == from_pkl.index
+        assert from_json.doc_lengths == from_pkl.doc_lengths
+
+    def test_positions_are_ints_after_json_round_trip(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        # JSON dumps Python ints as numeric literals and json.load
+        # restores them as ints (not strings). Lock this in -- a
+        # regression to str positions would silently break TF-IDF
+        # adjacency in phrase queries.
+        path = tmp_path / "x.json"
+        populated.save(path, fmt="json")
+        fresh = Indexer()
+        fresh.load(path, fmt="json")
+        for word_postings in fresh.index.values():
+            for posting in word_postings.values():
+                for pos in posting["positions"]:
+                    assert isinstance(pos, int)
+                assert isinstance(posting["freq"], int)
+
+    def test_doc_length_values_are_ints_after_json_round_trip(
+        self, populated: Indexer, tmp_path: Path
+    ) -> None:
+        # Same int-preservation check on the doc_lengths side.
+        path = tmp_path / "x.json"
+        populated.save(path, fmt="json")
+        fresh = Indexer()
+        fresh.load(path, fmt="json")
+        for length in fresh.doc_lengths.values():
+            assert isinstance(length, int)

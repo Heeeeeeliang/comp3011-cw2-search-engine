@@ -119,10 +119,19 @@ class SearchShell(cmd.Cmd):
         )
 
     def do_load(self, _arg: str) -> None:
-        """load : load the previously-saved index from disk."""
+        """load : load the previously-saved index from disk.
+
+        Prefers the pickle (3-5x faster on the live 213-page corpus
+        per the Day 3.4 benchmark logged in GENAI_LOG.md) and falls
+        back to the JSON file if the pickle is missing. The format
+        is auto-detected from the chosen path's extension; both
+        constants point to recognised suffixes so no explicit ``fmt``
+        is needed at the call site.
+        """
+        source = INDEX_PKL if INDEX_PKL.exists() else INDEX_JSON
         indexer = Indexer()
         try:
-            indexer.load(INDEX_JSON, fmt="json")
+            indexer.load(source)
         except FileNotFoundError:
             self._say("No index found. Run `build` first.")
             return
@@ -130,7 +139,7 @@ class SearchShell(cmd.Cmd):
         self.indexer = indexer
         self.search = SearchEngine(indexer)
         self._say(
-            f"Loaded {len(indexer.index)} words from {INDEX_JSON.as_posix()}"
+            f"Loaded {len(indexer.index)} words from {source.as_posix()}"
         )
 
     def do_print(self, arg: str) -> None:
