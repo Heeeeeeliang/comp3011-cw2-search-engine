@@ -718,6 +718,34 @@ class TestPhraseQueries:
         engine = SearchEngine(idx)
         assert engine.find('"good and"') == ["https://example.com/p1"]
 
+    def test_pure_stopword_unquoted_query_returns_empty(self) -> None:
+        # Unquoted variant of test_pure_stopword_phrase_returns_empty.
+        # `find("the and a")` -> tokenise each part -> all empty ->
+        # url_sets empty -> [].
+        idx = Indexer()
+        idx.build([("https://example.com/p", _wrap("good friends"))])
+        engine = SearchEngine(idx)
+        assert engine.find("the and a") == []
+        assert engine.find_with_scores("the and a") == []
+
+    def test_mixed_case_phrase_normalises(self) -> None:
+        # Spec-required edge case: `find "Good Friends"` and similar
+        # case variants must produce identical results to the
+        # lowercase form. Tokenise's lower() inside _parse_query
+        # handles this -- but the test pins the contract.
+        idx = Indexer()
+        idx.build([
+            ("https://example.com/p", _wrap("good friends here together")),
+        ])
+        engine = SearchEngine(idx)
+        baseline = engine.find('"good friends"')
+        assert engine.find('"Good Friends"') == baseline
+        assert engine.find('"GOOD FRIENDS"') == baseline
+        assert engine.find('"gOoD fRiEnDs"') == baseline
+        # And the baseline is non-empty so we're asserting on a real
+        # match, not just "all variants return []".
+        assert baseline == ["https://example.com/p"]
+
     def test_phrase_outranks_non_phrase_in_combined_query(self) -> None:
         # Sanity check on phrase-aware ranking: among AND-matching
         # docs, the phrase pre-filter has already trimmed the

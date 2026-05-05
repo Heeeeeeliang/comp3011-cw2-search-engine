@@ -280,6 +280,26 @@ class TestPolitenessDelay:
         list(crawler.iter_pages())
         assert sleeps == []  # exactly zero sleeps for a single fetch
 
+    def test_no_sleep_when_window_already_elapsed(self, monkeypatch) -> None:
+        # If the wall-clock gap since the last request already exceeds
+        # the politeness window, _wait_for_politeness must NOT sleep.
+        # This covers the `if remaining > 0` False branch -- in normal
+        # test runs `time.sleep` is mocked to a no-op so the True
+        # branch always fires and the False branch goes uncovered.
+        sleeps: list[float] = []
+        monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+
+        crawler = Crawler(
+            "https://example.com/",
+            delay=POLITENESS_DELAY,
+            session=_make_session({}),
+        )
+        # Pretend the last request was 100s ago. The 6s politeness
+        # window has long since elapsed, so no sleep is needed.
+        crawler._last_request_at = time.monotonic() - 100.0
+        crawler._wait_for_politeness()
+        assert sleeps == []
+
     def test_cache_hit_does_not_trigger_sleep(self, monkeypatch, tmp_path) -> None:
         sleeps: list[float] = []
         monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))

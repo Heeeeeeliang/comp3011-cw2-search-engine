@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Iterator
 
@@ -407,3 +408,59 @@ class TestMain:
         monkeypatch.setattr(sys, "stdout", _BadStdout())
         monkeypatch.setattr(SearchShell, "cmdloop", lambda self: None)
         main()  # must not raise
+
+
+# ----------------------------------------------------------------- TestCLIEdgeCases
+
+
+class TestCLIEdgeCases:
+    """Adversarial CLI-driver inputs called out by the Day 3.5 sweep."""
+
+    def test_rapid_sequence_of_commands_does_not_crash(self) -> None:
+        # Drive the full repertoire in quick succession through
+        # onecmd (the same dispatcher cmdloop uses). Mixes happy
+        # paths with error paths so any state-leak between commands
+        # surfaces (e.g. stale assert in _require_index).
+        shell = _populated_shell()
+        for command in [
+            "print hello",
+            "print world",
+            "print Absent",
+            "find hello",
+            "find hello world",
+            'find "hello world"',
+            "find absent",
+            "print",            # usage path
+            "find ",            # usage path
+            "nosuch arg",       # default() path
+            "print hello again",  # extra-words-use-first
+        ]:
+            shell.onecmd(command)
+        # No exception means pass; output should accumulate, not
+        # mysteriously drop on a particular command. Neither `print`
+        # nor `find` echoes the query word -- they emit URLs and JSON
+        # postings -- so the assertions key off output markers that
+        # are guaranteed to appear by the commands above.
+        out = shell.stdout.getvalue()
+        assert "https://example.com/p1" in out      # print/find emitted a URL
+        assert "Unknown command" in out             # default() path
+        assert "usage: print" in out                # `print` empty-arg
+        assert "usage: find" in out                 # `find ` empty-arg
+        assert "'Absent' not in index." in out      # print of unknown word
+        assert "No pages contain all of:" in out    # find with no match
+
+    def test_long_query_completes_quickly(self) -> None:
+        # Spec threshold: a 100-word query must finish under 1 second.
+        # On the 2-page test fixture this is trivially fast (sub-ms);
+        # the test is a regression guard against an accidental
+        # quadratic blow-up if find()'s parser/scorer ever degrades.
+        shell = _populated_shell()
+        big_query = "find " + " ".join(f"alpha{i:03d}" for i in range(100))
+        t0 = time.perf_counter()
+        shell.onecmd(big_query)
+        elapsed = time.perf_counter() - t0
+        assert elapsed < 1.0, f"100-word query took {elapsed:.3f}s"
+        # And the result is "no matches" because none of the synthetic
+        # tokens are in the fixture corpus -- a sanity check that the
+        # query was actually evaluated, not short-circuited somewhere.
+        assert "No pages contain all of:" in shell.stdout.getvalue()

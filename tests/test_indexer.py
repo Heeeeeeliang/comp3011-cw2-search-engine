@@ -988,3 +988,76 @@ class TestCrossFormatCompatibility:
         fresh.load(path, fmt="json")
         for length in fresh.doc_lengths.values():
             assert isinstance(length, int)
+
+
+# ------------------------------------------------------------- TestIndexerEdgeCases
+
+
+class TestIndexerEdgeCases:
+    """Adversarial input shapes the regular suite doesn't cover.
+
+    Most are already covered indirectly elsewhere; the ones here are
+    the ones the Day 3.5 sweep called out by name. Keeping them in a
+    dedicated class makes the "we tested adversarial inputs"
+    bookkeeping easy for the video.
+    """
+
+    def test_thousand_char_word_indexes_correctly(self) -> None:
+        # No upper bound on token length is enforced by the regex
+        # (`[a-z0-9']+` is greedy). A 1000-char run of letters should
+        # come out as a single token, indexed once.
+        long_word = "a" * 1000
+        idx = Indexer()
+        idx.build([("u", _wrap(f"<p>{long_word}</p>"))])
+        assert long_word in idx.index
+        assert idx.index[long_word]["u"]["freq"] == 1
+        # And the doc length recognises it as exactly one token.
+        assert idx.doc_lengths["u"] == 1
+
+    def test_non_ascii_content_strips_to_ascii_runs(self) -> None:
+        # Documented limitation: TOKEN_RE only matches [a-z0-9'].
+        # "Café" -> "caf" (the é is a separator), "naïve" -> "na" + "ve",
+        # "你好" -> nothing. "tokyo" and "world" survive intact.
+        # "in" is a stopword so dropped before stemming.
+        idx = Indexer()
+        idx.build([
+            ("u", _wrap("<p>Cafe Cafe in Tokyo - 你好 World naive</p>"))
+        ])
+        # "cafe" appears twice -- regression-checks the basic pipeline.
+        assert "cafe" in idx.index
+        assert idx.index["cafe"]["u"]["freq"] == 2
+        # Multi-byte characters never become tokens.
+        assert "你好" not in idx.index
+        # The non-ASCII variant has its accented letter as a separator.
+        idx2 = Indexer()
+        idx2.build([("u", _wrap("<p>Café</p>"))])
+        assert "caf" in idx2.index
+        assert "café" not in idx2.index
+
+    def test_purely_structural_html_indexes_nothing(self) -> None:
+        # Page has tags, attributes, but zero textual content.
+        # Different from the existing empty-body test in that it has
+        # plenty of markup -- exercising the get_text() path on a
+        # non-trivial DOM.
+        html = (
+            "<html><head><meta charset='utf-8'>"
+            "<link rel='stylesheet' href='x.css'></head>"
+            "<body><nav><ul><li></li></ul></nav>"
+            "<div class='wrap'><span></span></div></body></html>"
+        )
+        idx = Indexer()
+        idx.build([("u", html)])
+        assert idx.index == {}
+        assert idx.doc_lengths == {"u": 0}
+
+    def test_repeated_long_word_does_not_explode_positions(self) -> None:
+        # If a 100-char word appears 100 times the positions list has
+        # 100 entries; this is fine but worth confirming the structure.
+        long_word = "z" * 100
+        text = " ".join([long_word] * 50)
+        idx = Indexer()
+        idx.build([("u", _wrap(f"<p>{text}</p>"))])
+        assert idx.index[long_word]["u"]["freq"] == 50
+        assert len(idx.index[long_word]["u"]["positions"]) == 50
+        # Positions are 0..49 (no stopwords filter this token).
+        assert idx.index[long_word]["u"]["positions"] == list(range(50))
