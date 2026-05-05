@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Iterable, Union
 
 from bs4 import BeautifulSoup
+from nltk.stem import PorterStemmer
 
 LOGGER = logging.getLogger(__name__)
 
@@ -68,27 +69,78 @@ SUPPORTED_FORMATS: tuple[str, ...] = ("json", "pickle")
 # inside these is markup-machinery, never user-readable prose.
 NON_CONTENT_TAGS: tuple[str, ...] = ("script", "style")
 
+# Curated 50-word English stopword list. Embedded in source rather than
+# loaded via ``nltk.corpus.stopwords`` because that corpus requires
+# ``nltk.download('stopwords')``, which fails in offline / sandboxed
+# build environments. PorterStemmer, by contrast, ships pure-Python
+# rules in nltk and needs no data download — so we use it directly.
+# Contractions (don't, won't, it's) are deliberately excluded so the
+# tokeniser keeps the apostrophe-preserving behaviour TOKEN_RE provides.
+STOPWORDS: frozenset[str] = frozenset({
+    "the", "a", "an",
+    "and", "or", "but", "if", "of", "in", "on", "at", "by", "to", "for",
+    "from", "with", "as",
+    "is", "am", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had",
+    "do", "does", "did",
+    "this", "that", "these", "those",
+    "i", "you", "he", "she", "it", "we", "they",
+    "my", "your", "his", "her", "its", "our", "their",
+    "not",
+})
 
-def tokenise(text: str) -> list[str]:
-    """Return the lowercase token sequence for a piece of plain text.
+# Module-level stemmer: PorterStemmer is stateless across calls, so a
+# single shared instance avoids per-call object construction in the hot
+# tokenisation loop.
+_STEMMER = PorterStemmer()
+
+
+def tokenise(
+    text: str,
+    *,
+    remove_stopwords: bool = True,
+    stem: bool = True,
+) -> list[str]:
+    """Return the normalised token sequence for a piece of plain text.
 
     The tokeniser is the single source of truth for "what is a word" in
-    this project. It must be applied symmetrically at index time and at
-    query time, otherwise queries silently miss matches (e.g. an
-    upper-case query would never hit the lower-cased index).
+    this project. It is applied symmetrically at index time and at query
+    time — the **same** ``remove_stopwords`` and ``stem`` flags must be
+    used on both sides, or queries will silently miss matches. The
+    defaults (``True``, ``True``) are the production setting; explicit
+    ``False`` overrides exist so unit tests can isolate the regex layer.
+
+    Pipeline order: lowercase -> regex tokenise -> drop stopwords ->
+    Porter stem. Position-tracking callers (``Indexer.build``) iterate
+    the **returned** list, so positions reflect the post-filter index
+    — a page reading "the quick brown fox" puts "quick" at position 0,
+    not 1, because "the" was removed before position assignment. Phrase
+    queries (Task 3.3) rely on this contract.
 
     Parameters
     ----------
     text:
         Plain text. Callers are responsible for HTML-stripping first if
         they have markup; this function does not look at angle brackets.
+    remove_stopwords:
+        If True (default), drop tokens in :data:`STOPWORDS` before
+        stemming. Disable for tests that need to inspect raw tokens.
+    stem:
+        If True (default), apply Porter stemming. Disable for tests of
+        the regex layer in isolation.
 
     Returns
     -------
     list[str]
-        Tokens in document order. Empty input yields an empty list.
+        Tokens in document order, after the configured filters. Empty
+        input yields an empty list.
     """
-    return TOKEN_RE.findall(text.lower())
+    tokens = TOKEN_RE.findall(text.lower())
+    if remove_stopwords:
+        tokens = [t for t in tokens if t not in STOPWORDS]
+    if stem:
+        tokens = [_STEMMER.stem(t) for t in tokens]
+    return tokens
 
 
 def _strip_html(html: str) -> str:
@@ -231,9 +283,14 @@ class Indexer:
     def get_postings(self, word: str) -> dict:
         """Return the postings dict for ``word`` (empty dict if absent).
 
-        Lookup is case-insensitive: ``get_postings("Quote")`` and
-        ``get_postings("quote")`` are equivalent. Returning an empty dict
-        for missing words means callers can iterate the result without a
-        ``None`` check.
+        The query is run through :func:`tokenise` so the lookup uses the
+        same case-folding, stopword-filtering and stemming that the
+        index was built with — without that symmetry, a user query of
+        "Running" or "the" would never find anything. If the query
+        tokenises to nothing (e.g. it was a stopword, or pure
+        punctuation) an empty dict is returned.
         """
-        return self.index.get(word.lower(), {})
+        tokens = tokenise(word)
+        if not tokens:
+            return {}
+        return self.index.get(tokens[0], {})

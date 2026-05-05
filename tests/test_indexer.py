@@ -18,6 +18,7 @@ import pytest
 
 from src.indexer import (
     NON_CONTENT_TAGS,
+    STOPWORDS,
     SUPPORTED_FORMATS,
     TOKEN_RE,
     Indexer,
@@ -61,7 +62,13 @@ class TestTokenisation:
         assert tokenise("Hello WORLD") == ["hello", "world"]
 
     def test_preserves_apostrophes_in_contractions(self) -> None:
-        assert tokenise("don't won't it's") == ["don't", "won't", "it's"]
+        # Test the regex layer in isolation: with stemming on, Porter
+        # would strip the trailing s of "it's" and we'd be testing two
+        # things at once. remove_stopwords=False is for symmetry with
+        # the disabled-stem flag.
+        assert tokenise(
+            "don't won't it's", remove_stopwords=False, stem=False
+        ) == ["don't", "won't", "it's"]
 
     def test_extracts_alphanumeric_runs(self) -> None:
         assert tokenise("abc 123 mix4 7even") == ["abc", "123", "mix4", "7even"]
@@ -157,13 +164,15 @@ class TestBuild:
         assert idx.index["cat"]["u"]["positions"] == [0, 2, 4]
 
     def test_script_tag_excluded_from_index(self) -> None:
+        # Use "shown" (Porter-stable) rather than "visible" (->"visibl")
+        # so the assertion stays readable without referencing the stem.
         idx = Indexer()
         idx.build(
-            [("u", _wrap("<p>visible</p><script>alert(1)</script>"))]
+            [("u", _wrap("<p>shown</p><script>alert(1)</script>"))]
         )
         assert "alert" not in idx.index
         assert "1" not in idx.index
-        assert "visible" in idx.index
+        assert "shown" in idx.index
 
     def test_style_tag_excluded_from_index(self) -> None:
         idx = Indexer()
@@ -396,3 +405,162 @@ class TestGetPostings:
         # the index. (The empty dict is a fresh literal each call.)
         populated.get_postings("missing")["u"] = {"freq": 999, "positions": []}
         assert populated.get_postings("missing") == {}
+
+
+# -------------------------------------------------------------- TestStopwords
+
+
+class TestStopwords:
+    """Default tokenise() drops common English stopwords."""
+
+    @pytest.mark.parametrize(
+        "stopword", ["the", "a", "an", "is", "are", "was", "of", "and", "to"]
+    )
+    def test_stopword_absent_from_tokens(self, stopword: str) -> None:
+        # "{stopword} cat" -> ["cat"] when stopwords are filtered.
+        tokens = tokenise(f"{stopword} cat")
+        assert stopword not in tokens
+        assert "cat" in tokens
+
+    def test_stopwords_absent_from_built_index(self) -> None:
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>the cat is on the mat</p>"))])
+        # "the" and "is" must not be index keys.
+        assert "the" not in idx.index
+        assert "is" not in idx.index
+        # Content words survive (Porter doesn't change "cat" or "mat").
+        assert "cat" in idx.index
+        assert "mat" in idx.index
+
+    def test_pure_stopword_text_indexes_nothing(self) -> None:
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>the a an is are</p>"))])
+        assert idx.index == {}
+
+    def test_positions_assigned_after_stopword_removal(self) -> None:
+        # "the quick brown fox" -> after stopword "the" is dropped:
+        # ["quick", "brown", "fox"] at positions 0, 1, 2 — NOT 1, 2, 3.
+        # Phrase queries (Task 3.3) rely on this contract.
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>the quick brown fox</p>"))])
+        assert idx.index["quick"]["u"]["positions"] == [0]
+        assert idx.index["brown"]["u"]["positions"] == [1]
+        assert idx.index["fox"]["u"]["positions"] == [2]
+
+    def test_stopwords_set_size_is_curated(self) -> None:
+        # The brief calls for ~50 words; lock the count so an
+        # accidental edit (e.g. stray duplicate) is caught in CI.
+        assert len(STOPWORDS) == 50
+
+
+# --------------------------------------------------------------- TestStemming
+
+
+class TestStemming:
+    """Default tokenise() applies Porter stemming."""
+
+    def test_morphological_forms_collapse_to_one_stem(self) -> None:
+        # All four forms stem to "jump"; building a page with all of
+        # them yields a single index key with frequency 4.
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>jumping jumps jumped jump</p>"))])
+        assert "jump" in idx.index
+        assert idx.index["jump"]["u"]["freq"] == 4
+        assert idx.index["jump"]["u"]["positions"] == [0, 1, 2, 3]
+        # No raw form survives as a separate key.
+        for form in ("jumping", "jumps", "jumped"):
+            assert form not in idx.index
+
+    def test_running_and_runs_share_stem(self) -> None:
+        # The brief's example. Both forms must share the index key "run"
+        # so a query for either matches a page containing the other.
+        assert tokenise("running") == ["run"]
+        assert tokenise("runs") == ["run"]
+
+    def test_irregular_past_tense_does_not_lemmatise(self) -> None:
+        # Documented limitation of Porter (rule-based suffix stripper,
+        # not a true lemmatiser): "ran" stays as "ran". A real fix
+        # would mean swapping in a WordNet lemmatiser, which needs the
+        # nltk corpus download we deliberately avoided.
+        assert tokenise("ran") == ["ran"]
+
+    def test_query_stemming_matches_indexed_stem(self) -> None:
+        # Page contains "running"; user queries "runs". With symmetric
+        # stemming both reduce to "run" and the query hits.
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>running</p>"))])
+        assert idx.get_postings("runs") == idx.index["run"]
+
+
+# --------------------------------------------------------------- TestSymmetry
+
+
+class TestSymmetry:
+    """Index-time and query-time tokens use identical normalisation."""
+
+    def test_query_tokens_match_index_keys(self) -> None:
+        idx = Indexer()
+        idx.build(
+            [("u", _wrap("<p>The quickly running studies of jumping foxes</p>"))]
+        )
+        # Every key in the index must be reachable by tokenising the
+        # original page text — this is the contract that lets queries
+        # and storage agree on "what is a word".
+        page_tokens = tokenise(
+            "The quickly running studies of jumping foxes"
+        )
+        assert set(idx.index.keys()) == set(page_tokens)
+
+    def test_query_with_stopword_only_returns_no_results(self) -> None:
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>cat</p>"))])
+        # "the" alone tokenises to [] under default options; symmetry
+        # means the lookup must miss rather than spuriously hit.
+        assert idx.get_postings("the") == {}
+
+    def test_capitalised_morphological_query_matches_lowercased_stem(
+        self,
+    ) -> None:
+        idx = Indexer()
+        idx.build([("u", _wrap("<p>jumping</p>"))])
+        # Three forms of normalisation tested at once: case fold,
+        # stopword filter (no-op here), Porter stem. The query "Jumped"
+        # must round-trip to the same key as indexed "jumping".
+        assert idx.get_postings("Jumped") == idx.index["jump"]
+
+
+# ----------------------------------------------------------- TestDisabledOptions
+
+
+class TestDisabledOptions:
+    """Explicit False overrides bypass the new filters for raw inspection."""
+
+    def test_disabled_keeps_stopwords(self) -> None:
+        assert tokenise(
+            "the quick fox", remove_stopwords=False, stem=True
+        ) == ["the", "quick", "fox"]
+
+    def test_disabled_keeps_unstemmed_forms(self) -> None:
+        assert tokenise(
+            "running studies", remove_stopwords=True, stem=False
+        ) == ["running", "studies"]
+
+    def test_both_disabled_matches_pre_3_1_behaviour(self) -> None:
+        # With both flags off, tokenise reduces to lowercase + regex
+        # only — the Day 2 contract. Useful for tests of TOKEN_RE in
+        # isolation from the morphology layer.
+        assert tokenise(
+            "The Running Foxes Jumped", remove_stopwords=False, stem=False
+        ) == ["the", "running", "foxes", "jumped"]
+
+    def test_only_stem_disabled_still_drops_stopwords(self) -> None:
+        # Independent flags: stopword removal is unaffected by stem.
+        assert tokenise(
+            "the running fox", remove_stopwords=True, stem=False
+        ) == ["running", "fox"]
+
+    def test_only_stopwords_disabled_still_stems(self) -> None:
+        # And vice versa: stems are applied without stopword removal.
+        assert tokenise(
+            "the running fox", remove_stopwords=False, stem=True
+        ) == ["the", "run", "fox"]

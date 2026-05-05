@@ -151,7 +151,10 @@ class TestFindMultiWord:
         ]
 
     def test_intersection_of_three_words(self, engine: SearchEngine) -> None:
-        # "the", "quick", "fox" -> all three contain p1 and p2
+        # "the" is a stopword and is dropped at query-time, so the
+        # effective query is ("quick", "fox") -> p1, p2. The test still
+        # exercises a multi-token query path; what changed in 3.1 is
+        # that stopwords no longer contribute to the intersection.
         assert engine.find("the quick fox") == [
             "https://example.com/p1",
             "https://example.com/p2",
