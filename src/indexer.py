@@ -324,7 +324,7 @@ class Indexer:
                     sort_keys=True,
                     ensure_ascii=False,
                 )
-        else:  # fmt == "pickle"
+        else:
             with target.open("wb") as handle:
                 pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
         LOGGER.info(
@@ -369,7 +369,7 @@ class Indexer:
         if fmt == "json":
             with source.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
-        else:  # fmt == "pickle"
+        else:
             with source.open("rb") as handle:
                 payload = pickle.load(handle)
         if not isinstance(payload, dict) or "version" not in payload:

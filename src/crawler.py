@@ -38,7 +38,7 @@ from bs4 import BeautifulSoup
 LOGGER = logging.getLogger(__name__)
 
 POLITENESS_DELAY: float = 6.0  # seconds; assignment requires >= 6
-DEFAULT_TIMEOUT: float = 10.0  # per-request timeout
+DEFAULT_TIMEOUT: float = 10.0
 DEFAULT_USER_AGENT: str = (
     "COMP3011-CW2-Crawler/1.0 "
     "(University of Leeds coursework; +https://quotes.toscrape.com)"
