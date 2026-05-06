@@ -1,25 +1,7 @@
-"""
-Crawler module for COMP3011 Coursework 2.
+"""Politely BFS-crawls a single domain and returns ``(url, html)`` pairs.
 
-Politely BFS-crawls every same-domain page reachable from a seed URL and
-returns raw ``(url, html)`` pairs. Parsing for indexing is deliberately the
-Indexer's responsibility; the crawler stays HTTP-aware but content-agnostic.
-
-Design choices
---------------
-* **BFS over recursion.** Iterative BFS with an explicit queue gives us
-  deterministic ordering and avoids Python's recursion limit on sites with
-  long link chains.
-* **Politeness measured between requests, not in fixed sleeps.** We record
-  the wall-clock time of the last network request and only sleep for the
-  remainder of the 6-second window. Cache hits never sleep.
-* **Optional on-disk cache.** During development the assignment's 6-second
-  delay makes a full crawl take 10+ minutes; caching responses keyed by
-  URL hash lets us re-run ``build`` instantly. The cache lives outside the
-  repo (``.crawl_cache/`` by default) so it never gets committed.
-* **Errors per-page are warnings, not aborts.** A 404 or timeout on one
-  page must not lose the rest of the crawl. The seed URL is the one
-  exception: if it fails we have nothing to index, so we raise.
+Parsing is the Indexer's responsibility; the crawler stays content-agnostic.
+Per-page failures after the seed are logged and skipped; a failed seed raises.
 """
 
 from __future__ import annotations
@@ -37,7 +19,7 @@ from bs4 import BeautifulSoup
 
 LOGGER = logging.getLogger(__name__)
 
-POLITENESS_DELAY: float = 6.0  # seconds; assignment requires >= 6
+POLITENESS_DELAY: float = 6.0
 DEFAULT_TIMEOUT: float = 10.0
 DEFAULT_USER_AGENT: str = (
     "COMP3011-CW2-Crawler/1.0 "
@@ -58,20 +40,17 @@ class Crawler:
     Parameters
     ----------
     seed_url:
-        Starting URL. The crawl stays within this URL's network location.
+        Starting URL. The crawl stays within this URL's netloc.
     delay:
-        Minimum seconds between successive HTTP requests. Must be >= 6 to
-        comply with the assignment's politeness requirement.
+        Minimum seconds between requests. Must be >= 6.
     timeout:
         Per-request HTTP timeout in seconds.
     user_agent:
-        Sent in the ``User-Agent`` header. A descriptive UA is good net
-        citizenship and helps site owners identify the crawler.
+        Sent in the ``User-Agent`` header.
     cache_dir:
-        Optional directory in which to cache responses on disk. When set,
-        previously-fetched URLs are read from cache instead of re-fetched.
+        Optional on-disk response cache.
     session:
-        Optional pre-configured ``requests.Session`` (mainly for tests).
+        Optional pre-configured ``requests.Session`` (for tests).
     """
 
     def __init__(
@@ -110,12 +89,7 @@ class Crawler:
     def crawl(self) -> list[tuple[str, str]]:
         """Crawl the entire site and return every ``(url, html)`` pair.
 
-        Returns
-        -------
-        list[tuple[str, str]]
-            Materialised list of ``(url, html)`` pairs in BFS order. For
-            streaming over a partial result (without buffering the whole
-            corpus in memory) use :meth:`iter_pages` instead.
+        Use :meth:`iter_pages` to stream rather than buffer the whole corpus.
 
         Raises
         ------
@@ -126,24 +100,16 @@ class Crawler:
         return list(self.iter_pages())
 
     def iter_pages(self) -> Iterator[tuple[str, str]]:
-        """Yield ``(url, html)`` pairs lazily as pages are crawled.
+        """Yield ``(url, html)`` pairs lazily in BFS order.
 
-        Streaming is useful when callers want to start indexing while the
-        crawl is still running, or to display incremental progress.
-
-        Yields
-        ------
-        tuple[str, str]
-            ``(url, html)`` for each successfully fetched page in BFS
-            order. Pages that 404 or time out (after the seed) are
-            logged at WARNING and skipped without yielding.
+        Pages that 404 or time out (after the seed) are logged and skipped.
 
         Raises
         ------
         CrawlError
-            If the seed URL itself cannot be fetched on the first
-            iteration of the BFS loop.
+            If the seed URL itself cannot be fetched.
         """
+        # BFS with explicit queue: avoids Python's recursion limit on long link chains.
         queue: deque[str] = deque([self.seed_url])
         seen: set[str] = {self.seed_url}
         is_first = True
@@ -193,6 +159,7 @@ class Crawler:
         """Sleep just long enough that the next request is at least
         ``self.delay`` seconds after the previous one. No-op on the first
         request."""
+        # Sleep only the remainder since last live request; cache hits in _fetch never reach here.
         if self._last_request_at is None:
             return
         elapsed = time.monotonic() - self._last_request_at
@@ -223,16 +190,10 @@ class Crawler:
 
     @staticmethod
     def _normalise(url: str) -> str:
-        """Normalise URLs so trivially-different forms dedupe correctly.
-
-        Drops the fragment (``#section``) and any trailing slashes. So
-        ``https://x.com/`` becomes ``https://x.com`` and
-        ``https://x.com/a/`` becomes ``https://x.com/a``.
-        """
+        """Drop fragment and trailing slashes so trivially-different URLs dedupe."""
         clean, _ = urldefrag(url)
         stripped = clean.rstrip("/")
-        # Guard against a path-less URL collapsing to empty (shouldn't happen
-        # for valid http URLs, but be defensive).
+        # Guard against path-less URL collapsing to empty.
         return stripped if stripped else clean
 
     # --- cache helpers --------------------------------------------------

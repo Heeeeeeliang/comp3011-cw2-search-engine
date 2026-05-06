@@ -8,28 +8,7 @@ Provides an interactive shell with four commands::
     print <word>    print the inverted-index entry for <word>
     find <words>    list pages containing ALL given words
 
-Design choices
---------------
-* **``cmd.Cmd`` for the shell.** Standard library, gives us a prompt,
-  command dispatch, built-in ``help``, and clean ``EOF``/``exit``
-  handling for free. No third-party dependency, fully testable via
-  :meth:`onecmd` without entering the REPL.
-* **All output goes through ``self.stdout``.** ``cmd.Cmd`` already
-  routes its prompt and intro through ``self.stdout``; making the
-  ``do_*`` methods do the same means tests can capture output by
-  passing a :class:`io.StringIO`.
-* **Logging on stderr, results on stdout.** Crawl progress (INFO logs)
-  goes to stderr by default; the user's command results go to stdout.
-  This keeps the demo video transcript readable: stderr can be
-  redirected if it's noisy without losing the answer.
-* **UTF-8 stdout reconfigure on Windows.** Windows consoles default to
-  cp1252, which can mis-render any odd character that slips through
-  (URLs are ASCII-only, but defence in depth is cheap). The reconfigure
-  is best-effort because some non-TTY stdouts (notably ``pytest``'s
-  capture) don't expose the method.
-* **Index path is a constant, not user-configurable.** The brief
-  pins the submission to ``data/index.json``; a CLI flag would only
-  invite the marker to type a wrong path during evaluation.
+Logging goes to stderr; command output goes to stdout.
 """
 
 from __future__ import annotations
@@ -55,15 +34,7 @@ CACHE_DIR: str = ".crawl_cache"
 
 
 class SearchShell(cmd.Cmd):
-    """Interactive ``cmd.Cmd`` shell wired to crawler/indexer/search.
-
-    Parameters
-    ----------
-    stdin, stdout:
-        Forwarded to :class:`cmd.Cmd`. Tests pass :class:`io.StringIO`
-        instances to capture output; in production both default to the
-        process streams.
-    """
+    """Interactive ``cmd.Cmd`` shell wired to crawler/indexer/search."""
 
     intro: str = "Search engine ready. Type 'help' for commands, 'exit' to quit."
     prompt: str = "> "
@@ -80,12 +51,7 @@ class SearchShell(cmd.Cmd):
     # --------------------------------------------------------------- helpers
 
     def _say(self, message: str) -> None:
-        """Write a single line to ``self.stdout``.
-
-        Centralised so tests need only inspect one channel and so a
-        future change (e.g. piping to a logger or colourising) lands in
-        one place.
-        """
+        """Write a single line to ``self.stdout``."""
         print(message, file=self.stdout)
 
     def _require_index(self) -> bool:
@@ -121,12 +87,7 @@ class SearchShell(cmd.Cmd):
     def do_load(self, _arg: str) -> None:
         """load : load the previously-saved index from disk.
 
-        Prefers the pickle (3-5x faster on the live 213-page corpus
-        per the Day 3.4 benchmark logged in GENAI_LOG.md) and falls
-        back to the JSON file if the pickle is missing. The format
-        is auto-detected from the chosen path's extension; both
-        constants point to recognised suffixes so no explicit ``fmt``
-        is needed at the call site.
+        Prefers the pickle and falls back to JSON if the pickle is missing.
         """
         source = INDEX_PKL if INDEX_PKL.exists() else INDEX_JSON
         indexer = Indexer()
@@ -193,10 +154,8 @@ class SearchShell(cmd.Cmd):
 def main() -> None:
     """Entry point for ``python -m src.main``.
 
-    Configures logging so the user can see crawl progress, best-effort
-    upgrades stdout to UTF-8 (Windows consoles default to cp1252), and
-    hands off to the cmd-loop. Kept as a function (rather than inline
-    under ``if __name__``) so it can be tested directly.
+    Configures logging, best-effort upgrades stdout to UTF-8 (Windows
+    consoles default to cp1252), and hands off to the cmd-loop.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -207,8 +166,7 @@ def main() -> None:
         try:
             reconfigure(encoding="utf-8")
         except (OSError, ValueError):
-            # Some captured/pipe stdouts reject reconfigure; the rest of
-            # the CLI still works in cp1252 since URLs are ASCII.
+            # Some captured/pipe stdouts reject reconfigure; URLs are ASCII anyway.
             pass
     SearchShell().cmdloop()
 

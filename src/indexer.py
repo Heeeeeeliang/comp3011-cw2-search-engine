@@ -11,50 +11,9 @@ Builds and persists an inverted index of the form::
         ...
     }
 
-Design choices
---------------
-* **Nested dicts over a database.** A real corpus from quotes.toscrape.com
-  is a few hundred pages; the resulting index is a few hundred KB and fits
-  comfortably in memory. Plain dicts give us O(1) postings lookup with
-  zero infrastructure and a JSON file the marker can open and inspect.
-* **Two-step pipeline: HTML -> text -> tokens.** ``_strip_html`` is the
-  only place that knows about BeautifulSoup; ``tokenise`` is a pure
-  function over plain text. This split lets the search side reuse the
-  exact same tokeniser on user queries without dragging the DOM in,
-  which is what Task 2.2 will exercise.
-* **``<script>`` and ``<style>`` are decomposed, not just stripped.**
-  BeautifulSoup's ``.get_text()`` would otherwise emit inline JS bodies
-  as text (so ``<script>alert(1)</script>`` would yield the tokens
-  ``alert`` and ``1``). Calling ``.decompose()`` removes those subtrees
-  from the parse tree before extraction.
-* **Positions are tracked even though only ``freq`` is needed today.**
-  Day 3 phrase queries (``find "good friends"``) need positional
-  adjacency; recording positions during build is essentially free and
-  saves a re-index later.
-* **Dual JSON / Pickle storage with extension-based auto-detection.**
-  ``save``/``load`` accept ``fmt="json"`` or ``fmt="pickle"`` (rejected
-  otherwise with ``ValueError``). When ``fmt`` is omitted (the default
-  since Day 3.4), the format is inferred from the path's extension by
-  :func:`_format_from_path`: ``.json`` -> JSON, ``.pkl`` / ``.pickle``
-  -> Pickle, anything else -> JSON fallback. The fallback is JSON
-  rather than Pickle because (a) ``pickle.load`` executes arbitrary
-  code from the file — a quiet "default to pickle" would be a
-  security smell on a typo, (b) JSON is the inspectable format the
-  marker is told to open. The CLI's ``do_build`` writes both formats
-  side-by-side; ``do_load`` prefers the pickle for speed and falls
-  back to JSON.
-* **Build resets the index.** Calling ``build`` twice with different
-  page sets yields a clean rebuild rather than silent accumulation. This
-  is the more conservative choice and matches a marker's intuition: an
-  index is the output of a corpus, not a running tally.
-* **Doc lengths persisted alongside the postings.** Task 3.2 (TF-IDF)
-  needs the post-filter token count per URL, and reconstructing it
-  from the index would mean a full pass at load time. Storing
-  ``doc_lengths`` on disk makes ``load`` O(N) for restoring index +
-  lengths together. The on-disk shape is wrapped in a versioned
-  envelope (``{"version": 2, "index": ..., "doc_lengths": ...}``) so
-  pre-3.2 index files are detected and rejected with a helpful
-  rebuild prompt rather than silently producing garbled scores.
+Storage: JSON or Pickle (auto-detected from path extension). The on-disk
+shape is wrapped in a versioned envelope so older formats are rejected
+on load with a rebuild prompt.
 """
 
 from __future__ import annotations
@@ -71,46 +30,25 @@ from nltk.stem import PorterStemmer
 
 LOGGER = logging.getLogger(__name__)
 
-# Tokens are runs of lowercase ASCII letters/digits and apostrophes. The
-# apostrophe keeps contractions intact ("don't" -> "don't" rather than
-# "don" + "t"), which matters because the corpus is full of quoted text.
+# Apostrophe is in the character class so contractions ("don't") stay intact.
 TOKEN_RE = re.compile(r"[a-z0-9']+")
 
-# Whitelist of accepted on-disk formats. JSON is the human-readable
-# default and the format the marker can open and inspect; pickle is a
-# faster (and ~3-5x smaller) alternative used by the CLI for `load`
-# performance and benchmarked in the README.
 SUPPORTED_FORMATS: tuple[str, ...] = ("json", "pickle")
 
-# Mapping from file extension to format name used by _format_from_path.
-# Lower-case keys; the helper case-folds before lookup. Two entries map
-# to "pickle" (.pkl and .pickle) because both are widely seen on disk.
+# Lower-case keys; _format_from_path case-folds before lookup.
 _EXTENSION_TO_FORMAT: dict[str, str] = {
     ".json": "json",
     ".pkl": "pickle",
     ".pickle": "pickle",
 }
 
-# On-disk envelope version. Bumped from "no envelope" -> 2 in Task 3.2
-# when TF-IDF needed doc_lengths. Pre-3.2 files (a bare postings dict)
-# are detected on load and rejected with a "rebuild" prompt. Backfill
-# would be technically possible (the sum of freq per URL across all
-# terms equals the token count), but rebuilding from the cache is
-# ~150ms for 213 pages and the explicit version bump avoids quietly
-# mixing two on-disk shapes.
+# On-disk envelope version; bumping invalidates older index files on load.
 INDEX_FORMAT_VERSION: int = 2
 
-# Tags whose contents must be removed before text extraction. Anything
-# inside these is markup-machinery, never user-readable prose.
+# Tags whose contents are markup, not prose; decomposed before extraction.
 NON_CONTENT_TAGS: tuple[str, ...] = ("script", "style")
 
-# Curated 50-word English stopword list. Embedded in source rather than
-# loaded via ``nltk.corpus.stopwords`` because that corpus requires
-# ``nltk.download('stopwords')``, which fails in offline / sandboxed
-# build environments. PorterStemmer, by contrast, ships pure-Python
-# rules in nltk and needs no data download — so we use it directly.
-# Contractions (don't, won't, it's) are deliberately excluded so the
-# tokeniser keeps the apostrophe-preserving behaviour TOKEN_RE provides.
+# Embedded list (no nltk.download required); contractions excluded so apostrophes survive.
 STOPWORDS: frozenset[str] = frozenset({
     "the", "a", "an",
     "and", "or", "but", "if", "of", "in", "on", "at", "by", "to", "for",
@@ -124,9 +62,7 @@ STOPWORDS: frozenset[str] = frozenset({
     "not",
 })
 
-# Module-level stemmer: PorterStemmer is stateless across calls, so a
-# single shared instance avoids per-call object construction in the hot
-# tokenisation loop.
+# PorterStemmer is stateless; share one instance across calls.
 _STEMMER = PorterStemmer()
 
 
@@ -138,37 +74,27 @@ def tokenise(
 ) -> list[str]:
     """Return the normalised token sequence for a piece of plain text.
 
-    The tokeniser is the single source of truth for "what is a word" in
-    this project. It is applied symmetrically at index time and at query
-    time — the **same** ``remove_stopwords`` and ``stem`` flags must be
-    used on both sides, or queries will silently miss matches. The
-    defaults (``True``, ``True``) are the production setting; explicit
-    ``False`` overrides exist so unit tests can isolate the regex layer.
+    Applied symmetrically at index time and query time — the same
+    ``remove_stopwords`` and ``stem`` flags must be used on both sides
+    or queries silently miss matches.
 
-    Pipeline order: lowercase -> regex tokenise -> drop stopwords ->
-    Porter stem. Position-tracking callers (``Indexer.build``) iterate
-    the **returned** list, so positions reflect the post-filter index
-    — a page reading "the quick brown fox" puts "quick" at position 0,
-    not 1, because "the" was removed before position assignment. Phrase
-    queries (Task 3.3) rely on this contract.
+    Pipeline: lowercase -> regex tokenise -> drop stopwords -> Porter stem.
+    Positions are assigned to the post-filter stream (stopwords removed
+    before positions stamp), which phrase queries rely on.
 
     Parameters
     ----------
     text:
-        Plain text. Callers are responsible for HTML-stripping first if
-        they have markup; this function does not look at angle brackets.
+        Plain text. Caller HTML-strips first if needed.
     remove_stopwords:
-        If True (default), drop tokens in :data:`STOPWORDS` before
-        stemming. Disable for tests that need to inspect raw tokens.
+        If True (default), drop tokens in :data:`STOPWORDS` before stemming.
     stem:
-        If True (default), apply Porter stemming. Disable for tests of
-        the regex layer in isolation.
+        If True (default), apply Porter stemming.
 
     Returns
     -------
     list[str]
-        Tokens in document order, after the configured filters. Empty
-        input yields an empty list.
+        Tokens in document order. Empty input yields an empty list.
     """
     tokens = TOKEN_RE.findall(text.lower())
     if remove_stopwords:
@@ -181,23 +107,12 @@ def tokenise(
 def _format_from_path(path: Union[str, Path]) -> str:
     """Resolve the on-disk format from a file path's extension.
 
-    Recognised extensions:
-
     * ``.json`` -> ``"json"``
     * ``.pkl`` / ``.pickle`` -> ``"pickle"``
-    * anything else (or no extension) -> ``"json"`` fallback
+    * anything else -> ``"json"`` fallback
 
-    Case-insensitive; ``.JSON`` and ``.PKL`` route the same as
-    lower-case. The fallback is ``json`` because (a) it's the
-    human-readable format the marker is told to inspect, so a
-    typo'd extension landing on a JSON write at least produces an
-    inspectable artefact rather than a binary blob, and (b) silently
-    treating an unknown extension as pickle would be a security smell
-    (``pickle.load`` executes arbitrary code from the file).
-
-    Used by :meth:`Indexer.save` and :meth:`Indexer.load` when the
-    caller passes ``fmt=None`` (the new default in Day 3.4). Existing
-    callers that pass ``fmt`` explicitly are unaffected.
+    Case-insensitive. The fallback is JSON (not Pickle) because
+    ``pickle.load`` would execute arbitrary code on unknown extensions.
     """
     suffix = Path(path).suffix.lower()
     return _EXTENSION_TO_FORMAT.get(suffix, "json")
@@ -206,10 +121,9 @@ def _format_from_path(path: Union[str, Path]) -> str:
 def _strip_html(html: str) -> str:
     """Convert raw HTML to plain text suitable for tokenisation.
 
-    Removes ``<script>`` and ``<style>`` subtrees outright (their bodies
-    are code, not content) and joins remaining text with a space so words
-    don't run together across tag boundaries (``<p>foo</p><p>bar</p>``
-    becomes ``"foo bar"``, never ``"foobar"``).
+    Decomposes ``<script>`` and ``<style>`` outright (their bodies are
+    code, not content) and joins the remainder with a space so words
+    don't run together across tag boundaries.
     """
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(list(NON_CONTENT_TAGS)):
@@ -220,19 +134,13 @@ def _strip_html(html: str) -> str:
 class Indexer:
     """Build, persist, and query an inverted index of crawled pages.
 
-    The index is exposed directly via :attr:`index` for the rare callers
-    (currently only the CLI's ``print`` command and the search ranker)
-    that need bulk access. Day-to-day lookups should go through
-    :meth:`get_postings`, which handles case-folding and the
-    "word not present" case uniformly.
+    Use :meth:`get_postings` for word lookups (handles case-fold and missing
+    keys); :attr:`index` is exposed for callers needing bulk access.
     """
 
     def __init__(self) -> None:
         self.index: dict[str, dict[str, dict]] = {}
-        # url -> count of post-filter tokens. Populated by build(); used
-        # by SearchEngine._score for the TF denominator. Stored on every
-        # indexed URL (including 0-token pages, which can't appear in
-        # any postings but still count toward N for IDF).
+        # 0-token pages still count toward N for IDF, so doc_lengths records every URL.
         self.doc_lengths: dict[str, int] = {}
 
     # ------------------------------------------------------------------ public
@@ -240,16 +148,12 @@ class Indexer:
     def build(self, pages: Iterable[tuple[str, str]]) -> None:
         """Populate :attr:`index` and :attr:`doc_lengths` from ``pages``.
 
-        Streaming is supported: ``pages`` may be a generator from the
-        crawler, so we never need the whole corpus in memory at once. The
-        existing index is discarded at the start of every build to keep
-        repeated builds idempotent.
+        Existing state is discarded; repeated builds are idempotent.
 
         Parameters
         ----------
         pages:
-            Any iterable yielding ``(url, html)`` tuples. URLs are stored
-            verbatim as posting keys; HTML is parsed and tokenised.
+            Iterable of ``(url, html)`` tuples. Streaming is supported.
         """
         self.index = {}
         self.doc_lengths = {}
@@ -270,37 +174,23 @@ class Indexer:
     def save(
         self, path: Union[str, Path], fmt: Optional[str] = None
     ) -> None:
-        """Serialise :attr:`index` to ``path``.
+        """Serialise :attr:`index` and :attr:`doc_lengths` to ``path``.
 
-        Two on-disk formats are supported:
-
-        * ``"json"`` — human-readable, ``indent=2``, ``sort_keys=True``,
-          ``ensure_ascii=False``. The format the marker is told to
-          inspect the index file in, and deterministic key order makes
-          diffing two builds straightforward.
-        * ``"pickle"`` — binary, faster to load and noticeably smaller
-          on disk. Used by the CLI so subsequent ``load`` invocations
-          don't pay the JSON parse cost.
+        JSON is human-readable (``indent=2``, ``sort_keys=True``); pickle
+        is binary and faster to load.
 
         Parameters
         ----------
         path:
-            Destination file. The parent directory is created if missing.
+            Destination file. Parent directory is created if missing.
         fmt:
-            Storage format; one of ``"json"`` or ``"pickle"``. If
-            omitted (the default since Day 3.4), the format is
-            inferred from the path's extension via
-            :func:`_format_from_path`: ``.json`` -> JSON, ``.pkl`` /
-            ``.pickle`` -> Pickle, anything else -> JSON fallback.
-            Pass an explicit ``fmt`` to override the inference.
+            ``"json"`` or ``"pickle"``. If omitted, inferred from the path
+            extension via :func:`_format_from_path`.
 
         Raises
         ------
         ValueError
-            If ``fmt`` is not in :data:`SUPPORTED_FORMATS`. (The
-            auto-detected fallback is always ``"json"``, which is
-            valid; this only fires when a caller passes an explicit
-            unsupported value like ``"yaml"``.)
+            If ``fmt`` is not in :data:`SUPPORTED_FORMATS`.
         """
         if fmt is None:
             fmt = _format_from_path(path)
@@ -341,23 +231,20 @@ class Indexer:
         path:
             Source file produced by :meth:`save`.
         fmt:
-            Storage format; must match what :meth:`save` wrote. If
-            omitted (the default since Day 3.4), the format is
-            inferred from the path's extension via
-            :func:`_format_from_path` — symmetric with :meth:`save`.
+            Storage format; if omitted, inferred from path extension
+            (symmetric with :meth:`save`).
 
         Raises
         ------
         ValueError
-            If ``fmt`` is not in :data:`SUPPORTED_FORMATS`, or if the
-            file is in a pre-3.2 (un-versioned) format, or carries a
-            version this build doesn't understand.
+            If ``fmt`` is unsupported, the file is in a pre-versioned
+            format, or the version is not understood.
         FileNotFoundError
             If ``path`` does not exist.
         json.JSONDecodeError
-            If the file exists but is not valid JSON.
+            If a JSON file is corrupt.
         pickle.UnpicklingError
-            If a JSON file is loaded with ``fmt="pickle"``.
+            If a pickle file is corrupt or fmt mismatch.
         """
         if fmt is None:
             fmt = _format_from_path(path)
@@ -391,25 +278,19 @@ class Indexer:
         """Return the postings dict for ``word`` (empty dict if absent).
 
         The query is run through :func:`tokenise` so the lookup uses the
-        same case-folding, stopword-filtering and stemming that the
-        index was built with — without that symmetry, a user query of
-        "Running" or "the" would never find anything.
+        same case-fold/stopword/stem rules as the index.
 
         Parameters
         ----------
         word:
-            The query word. Free-form text; case, stopwords, and Porter
-            stemming are normalised before lookup. Multi-word inputs use
-            only the first resulting stem (callers wanting AND or
-            phrase semantics should use :class:`SearchEngine`).
+            Free-form text. Multi-word inputs use only the first stem.
 
         Returns
         -------
         dict
-            ``{url: {"freq": int, "positions": [int, ...]}}`` for every
-            URL containing the word's stem. Empty dict when the word
-            tokenises to nothing (e.g. it was a stopword) or when no
-            page in the corpus contains the stem.
+            ``{url: {"freq": int, "positions": [int, ...]}}`` for the
+            word's stem. Empty dict if the word tokenises to nothing
+            or is absent.
         """
         tokens = tokenise(word)
         if not tokens:
