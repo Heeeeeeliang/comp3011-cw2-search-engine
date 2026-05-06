@@ -168,8 +168,20 @@ class SearchEngine:
         Delegates to :meth:`Indexer.get_postings`, which already handles
         the lower-case fold. Kept on this class (rather than calling the
         indexer directly from the CLI) so all read-side concerns live in
-        one place — useful when Day 3 adds TF-IDF metadata to the
-        formatted output.
+        one place.
+
+        Parameters
+        ----------
+        word:
+            The query word. Tokenised with the same rules used at index
+            time; multi-word input uses only the first resulting stem.
+
+        Returns
+        -------
+        dict
+            ``{url: {"freq": int, "positions": [int, ...]}}`` for every
+            URL containing the word's stem. Empty dict for unknown or
+            stopword-only queries.
         """
         return self.indexer.get_postings(word)
 
@@ -224,6 +236,15 @@ class SearchEngine:
         the result is sorted alphabetically by URL. Without that the
         order would depend on ``set`` iteration order, which is stable
         within a Python run but not across versions.
+
+        Parameters
+        ----------
+        query:
+            Free-form user input. Whitespace-separated bare words form
+            an AND query; double-quoted runs form phrase atoms. Tokens
+            are normalised with the same case-fold / stopword / Porter
+            pipeline used at index time. An unbalanced ``"`` is caught
+            and yields an empty result rather than propagating.
 
         Returns
         -------

@@ -110,10 +110,18 @@ class Crawler:
     def crawl(self) -> list[tuple[str, str]]:
         """Crawl the entire site and return every ``(url, html)`` pair.
 
+        Returns
+        -------
+        list[tuple[str, str]]
+            Materialised list of ``(url, html)`` pairs in BFS order. For
+            streaming over a partial result (without buffering the whole
+            corpus in memory) use :meth:`iter_pages` instead.
+
         Raises
         ------
         CrawlError
-            If the seed URL itself cannot be fetched.
+            If the seed URL itself cannot be fetched. Per-page failures
+            after the seed are logged and skipped, not raised.
         """
         return list(self.iter_pages())
 
@@ -122,6 +130,19 @@ class Crawler:
 
         Streaming is useful when callers want to start indexing while the
         crawl is still running, or to display incremental progress.
+
+        Yields
+        ------
+        tuple[str, str]
+            ``(url, html)`` for each successfully fetched page in BFS
+            order. Pages that 404 or time out (after the seed) are
+            logged at WARNING and skipped without yielding.
+
+        Raises
+        ------
+        CrawlError
+            If the seed URL itself cannot be fetched on the first
+            iteration of the BFS loop.
         """
         queue: deque[str] = deque([self.seed_url])
         seen: set[str] = {self.seed_url}

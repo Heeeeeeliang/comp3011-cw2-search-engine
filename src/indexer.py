@@ -393,9 +393,23 @@ class Indexer:
         The query is run through :func:`tokenise` so the lookup uses the
         same case-folding, stopword-filtering and stemming that the
         index was built with — without that symmetry, a user query of
-        "Running" or "the" would never find anything. If the query
-        tokenises to nothing (e.g. it was a stopword, or pure
-        punctuation) an empty dict is returned.
+        "Running" or "the" would never find anything.
+
+        Parameters
+        ----------
+        word:
+            The query word. Free-form text; case, stopwords, and Porter
+            stemming are normalised before lookup. Multi-word inputs use
+            only the first resulting stem (callers wanting AND or
+            phrase semantics should use :class:`SearchEngine`).
+
+        Returns
+        -------
+        dict
+            ``{url: {"freq": int, "positions": [int, ...]}}`` for every
+            URL containing the word's stem. Empty dict when the word
+            tokenises to nothing (e.g. it was a stopword) or when no
+            page in the corpus contains the stem.
         """
         tokens = tokenise(word)
         if not tokens:
